@@ -3,9 +3,9 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# poppler + mupdf
+# poppler + mupdf + webp tools + fonts for watermark rendering
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    poppler-utils mupdf-tools curl \
+    poppler-utils mupdf-tools webp fonts-dejavu-core curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

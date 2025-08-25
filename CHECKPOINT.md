@@ -1,3 +1,5 @@
+[2025-08-25 22:22] [roma] — clients миграции применены; upload→render_webp пайплайн собран; требуется ускорение рендера (<30s).
+[2025-08-25 22:22] [roma] — clients миграции применены; upload→render_webp пайплайн собран; требуется ускорение рендера (<30s).
 [2025-08-25 19:01] [Life PC] — render: MuPDF (mutool) основной, fallbacks pdftocairo/pdftoppm; PNG высокого качества; /upload -> /job -> /files OK
 [2025-08-25 17:19] [Life PC] — добавили каркас рендера: /render → worker(kind=render) → /job/{id}
 [2025-08-25 17:16] [Life PC] — userbot session в volume; healthz=ok после рестартов
@@ -14,6 +16,8 @@
 > [YYYY-MM-DD HH:MM] [author] — что сделали / что ломалось / что хотим дальше.
 
 [INIT PLACEHOLDER]
+
+
 
 
 

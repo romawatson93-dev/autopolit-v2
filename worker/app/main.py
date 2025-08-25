@@ -1,6 +1,7 @@
-import os, json, threading, time, tempfile, subprocess, shlex, sys
+import os, sys, json, threading, time, tempfile, subprocess, shlex, hashlib
 from fastapi import FastAPI
 from redis import Redis
+from PIL import Image, ImageDraw, ImageFont
 import requests
 
 app = FastAPI(title="autopolit-v2 WORKER")
@@ -9,11 +10,14 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 QUEUE_KEY = "jobs"
 JOB_PREFIX = "job:"
 DATA_DIR = "/data"
+PDF_DIR = os.path.join(DATA_DIR, "pdf")
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+os.makedirs(PDF_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Настройки (в .env можно менять)
-RENDER_DPI = int(os.getenv("RENDER_DPI", "240"))               # высокое, но разумное по скорости
-RENDER_TIMEOUT_SEC = int(os.getenv("RENDER_TIMEOUT_SEC", "90"))
-RENDER_FALLBACK = os.getenv("RENDER_FALLBACK", "1") == "1"     # включён
+RENDER_DPI = int(os.getenv("RENDER_DPI", "300"))
+RENDER_TIMEOUT_SEC = int(os.getenv("RENDER_TIMEOUT_SEC", "240"))
+RENDER_FALLBACK = os.getenv("RENDER_FALLBACK", "1") == "1"
 
 def r() -> Redis:
     return Redis.from_url(REDIS_URL, decode_responses=True)
@@ -21,108 +25,111 @@ def r() -> Redis:
 def log(*a):
     print("[worker]", *a, file=sys.stderr, flush=True)
 
-def _ensure_output(out_png_path: str, out_prefix: str) -> None:
-    if os.path.exists(out_png_path):
-        return
-    alt = out_prefix + ".png"
-    if os.path.exists(alt):
-        os.replace(alt, out_png_path)
-        return
-    raise RuntimeError("renderer did not produce output file")
+def _sha8(txt: str) -> str:
+    return hashlib.sha256(txt.encode("utf-8")).hexdigest()[:8]
 
-def _run(cmd: str, timeout_sec: int) -> subprocess.CompletedProcess:
+def cache_key(pdf_sha: str, wm_text: str | None) -> str:
+    wm_part = f"_wm_{_sha8(wm_text)}" if wm_text else ""
+    return f"{pdf_sha}_d{RENDER_DPI}{wm_part}.webp"
+
+def run(cmd: str, timeout_sec: int):
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_sec)
 
-# --- Рендер №1: MuPDF (mutool) — очень быстрый ---
-def render_with_mutool(pdf_path: str, out_png_path: str, dpi: int, timeout_sec: int):
-    # mutool draw -F png -r <dpi> -o <exact.png> <pdf> 1
-    cmd = f"mutool draw -F png -r {dpi} -o {shlex.quote(out_png_path)} {shlex.quote(pdf_path)} 1"
+def render_png_with_mutool(pdf_path: str, out_png_path: str):
+    cmd = f"mutool draw -F png -r {RENDER_DPI} -o {shlex.quote(out_png_path)} {shlex.quote(pdf_path)} 1"
     log("run(mutool):", cmd)
-    res = _run(cmd, timeout_sec)
+    res = run(cmd, RENDER_TIMEOUT_SEC)
     if res.returncode != 0 and not os.path.exists(out_png_path):
         raise RuntimeError(f"mutool failed ({res.returncode}): {res.stderr.decode('utf-8','ignore')}")
 
-# --- Рендер №2: pdftocairo (fallback) ---
-def render_with_pdftocairo(pdf_path: str, out_png_path: str, dpi: int, timeout_sec: int):
-    out_prefix = os.path.splitext(out_png_path)[0]
-    cmd = f"pdftocairo -png -singlefile -f 1 -l 1 -r {dpi} {shlex.quote(pdf_path)} {shlex.quote(out_prefix)}"
-    log("run(pdftocairo):", cmd)
-    res = _run(cmd, timeout_sec)
-    if res.returncode != 0 and not (os.path.exists(out_png_path) or os.path.exists(out_prefix + '.png')):
-        raise RuntimeError(f"pdftocairo failed ({res.returncode}): {res.stderr.decode('utf-8','ignore')}")
-    _ensure_output(out_png_path, out_prefix)
-
-# --- Рендер №3: pdftoppm (второй fallback) ---
-def render_with_pdftoppm(pdf_path: str, out_png_path: str, dpi: int, timeout_sec: int):
-    out_prefix = os.path.splitext(out_png_path)[0]
-    cmd = f"pdftoppm -singlefile -png -f 1 -l 1 -r {dpi} {shlex.quote(pdf_path)} {shlex.quote(out_prefix)}"
-    log("run(pdftoppm):", cmd)
-    res = _run(cmd, timeout_sec)
-    if res.returncode != 0 and not (os.path.exists(out_png_path) or os.path.exists(out_prefix + '.png')):
-        raise RuntimeError(f"pdftoppm failed ({res.returncode}): {res.stderr.decode('utf-8','ignore')}")
-    _ensure_output(out_png_path, out_prefix)
-
-def render_first_page(pdf_path: str, out_png_path: str):
-    # 1) Сначала пробуем MuPDF (быстро и качественно)
-    try:
-        render_with_mutool(pdf_path, out_png_path, dpi=RENDER_DPI, timeout_sec=RENDER_TIMEOUT_SEC)
-        return
-    except Exception as e:
-        log(f"mutool error: {e}")
-    # 2) Fallback на pdftocairo
-    if RENDER_FALLBACK:
+def png_to_webp_lossless_with_watermark(png_path: str, out_webp_path: str, wm_text: str | None):
+    img = Image.open(png_path).convert("RGBA")
+    if wm_text:
+        # Ненавязчивая диагональная сетка ватермарок
+        W, H = img.size
+        overlay = Image.new("RGBA", img.size, (0,0,0,0))
+        draw = ImageDraw.Draw(overlay)
+        # простая метрика размера шрифта
+        base = max(16, min(W, H)//18)
         try:
-            render_with_pdftocairo(pdf_path, out_png_path, dpi=RENDER_DPI, timeout_sec=RENDER_TIMEOUT_SEC)
-            return
-        except Exception as e:
-            log(f"pdftocairo error: {e}")
-        # 3) Второй fallback на pdftoppm
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", base)
+        except:
+            font = ImageFont.load_default()
+
+        # «плитка» — шаг по диагонали
+        text = wm_text[:200]
+        # полупрозрачный серый
+        fill = (0,0,0,70)
+        # угол
+        angle = -30
+
+        # создаём текстовый слой, чтобы поворачивать разом
+        tile = Image.new("RGBA", (W, H), (0,0,0,0))
+        td = ImageDraw.Draw(tile)
+
+        # отступ по сетке
+        step = int(base * 6.0)
+        for y in range(-H, H*2, step):
+            for x in range(-W, W*2, step):
+                td.text((x, y), text, font=font, fill=fill)
+
+        tile = tile.rotate(angle, expand=1)
+        # обрежем по краям до исходного размера и смешаем
+        tx, ty = (tile.size[0]-W)//2, (tile.size[1]-H)//2
+        tile = tile.crop((tx, ty, tx+W, ty+H))
+        img = Image.alpha_composite(img, tile)
+
+    # сохраняем lossless WebP
+    img = img.convert("RGB")
+    img.save(out_webp_path, format="WEBP", lossless=True, quality=100, method=6)
+
+def handle_render_webp(payload: dict, job_id: str) -> dict:
+    pdf_sha = payload.get("pdf_sha") or ""
+    local_pdf = payload.get("local_pdf") or ""
+    wm_text = (payload.get("watermark_text") or "").strip() or None
+
+    if not os.path.exists(local_pdf):
+        return {"error": f"local pdf not found: {local_pdf}"}
+
+    # кэш
+    ckey = cache_key(pdf_sha, wm_text)
+    cache_path = os.path.join(CACHE_DIR, ckey)
+
+    if os.path.exists(cache_path):
+        # отдаём из кэша: просто скопируем под job_id
+        out_webp = os.path.join(DATA_DIR, f"{job_id}.webp")
+        if os.path.exists(out_webp):
+            os.remove(out_webp)
+        # жёсткая ссылка/копия
         try:
-            render_with_pdftoppm(pdf_path, out_png_path, dpi=RENDER_DPI, timeout_sec=RENDER_TIMEOUT_SEC)
-            return
-        except Exception as e:
-            log(f"pdftoppm error: {e}")
-    raise RuntimeError("all renderers failed or timed out")
+            os.link(cache_path, out_webp)
+        except Exception:
+            import shutil; shutil.copy2(cache_path, out_webp)
 
-# ==== обработчики ====
-def handle_echo(payload: dict) -> dict:
-    name = (payload.get("name") or "").strip()
-    time.sleep(0.2)
-    return {"upper": name.upper(), "length": len(name)}
+        return {"pages": 1, "webp": f"{job_id}.webp", "url": f"http://127.0.0.1:8000/files/{job_id}.webp", "cache": True}
 
-def _render_from_pdf_path(pdf_path: str, job_id: str) -> dict:
-    out_path = os.path.join(DATA_DIR, f"{job_id}.png")
-    render_first_page(pdf_path, out_path)
-    return {"pages": 1, "png": f"{job_id}.png", "url": f"http://127.0.0.1:8000/files/{job_id}.png"}
-
-def handle_render(payload: dict, job_id: str) -> dict:
-    local_path = payload.get("local_path")
-    doc_url = payload.get("doc_url")
-
-    if local_path:
-        if not os.path.exists(local_path):
-            return {"error": f"local file not found: {local_path}"}
-        log(f"render(local): job={job_id} {local_path}")
-        return _render_from_pdf_path(local_path, job_id)
-
-    if not doc_url:
-        return {"error": "provide doc_url or local_path"}
-
-    log(f"render(url): job={job_id} {doc_url}")
+    # рендер
     with tempfile.TemporaryDirectory() as td:
-        pdf_path = os.path.join(td, "doc.pdf")
-        with requests.get(doc_url, timeout=30, stream=True) as resp:
-            resp.raise_for_status()
-            with open(pdf_path, "wb") as f:
-                for chunk in resp.iter_content(8192):
-                    if chunk:
-                        f.write(chunk)
-        return _render_from_pdf_path(pdf_path, job_id)
+        tmp_png = os.path.join(td, "p1.png")
+        render_png_with_mutool(local_pdf, tmp_png)
+        # watermark + webp
+        tmp_webp = os.path.join(td, "p1.webp")
+        png_to_webp_lossless_with_watermark(tmp_png, tmp_webp, wm_text)
+
+        # поместим в кэш и под job_id
+        out_webp = os.path.join(DATA_DIR, f"{job_id}.webp")
+        import shutil
+        shutil.copy2(tmp_webp, cache_path)
+        shutil.copy2(tmp_webp, out_webp)
+
+    return {"pages": 1, "webp": f"{job_id}.webp", "url": f"http://127.0.0.1:8000/files/{job_id}.webp", "cache": False}
 
 HANDLERS = {
-    "echo": lambda payload, job_id=None: handle_echo(payload),
-    "render": handle_render,
+    "render_webp": handle_render_webp,
 }
+
+from fastapi import FastAPI
+app = FastAPI(title="autopolit-v2 WORKER")
 
 def worker_loop():
     client = r()
@@ -146,12 +153,11 @@ def worker_loop():
                 continue
 
             try:
-                if kind == "render":
-                    res = handler(payload, job_id=job_id)
-                else:
-                    res = handler(payload)
+                res = handler(payload, job_id=job_id)
+                if "error" in res:
+                    raise RuntimeError(res["error"])
                 client.hset(JOB_PREFIX+job_id, mapping={
-                    "status": "done",
+                    "status":"done",
                     "result": json.dumps(res, ensure_ascii=False),
                     "kind": kind,
                 })
@@ -162,7 +168,6 @@ def worker_loop():
             except Exception as e:
                 client.hset(JOB_PREFIX+job_id, mapping={"status":"error","error":str(e)})
                 log(f"error job: {job_id} -> {e}")
-
         except Exception as e:
             log(f"loop error: {e}")
             time.sleep(0.5)
@@ -177,6 +182,6 @@ def startup():
 def healthz():
     try:
         r().ping()
-        return {"status": "ok", "service": "worker", "redis": "ok"}
+        return {"status":"ok","service":"worker","redis":"ok"}
     except Exception:
-        return {"status": "fail", "service": "worker", "redis": "fail"}
+        return {"status":"fail","service":"worker","redis":"fail"}

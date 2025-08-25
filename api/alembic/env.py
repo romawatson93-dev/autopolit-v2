@@ -1,43 +1,44 @@
+import os, sys
 from logging.config import fileConfig
-import os
-from sqlalchemy import engine_from_config, pool
 from alembic import context
+from sqlalchemy import pool
 
-# импорт моделей (для autogenerate, если понадобится)
-from app.db import Base
-from app import models  # noqa: F401
+# критично: добавляем /app в PYTHONPATH внутри контейнера
+if "/app" not in sys.path:
+    sys.path.insert(0, "/app")
+
+from app.db import engine
+from app.models import Base
 
 config = context.config
-
-# Берём DATABASE_URL из окружения контейнера
-database_url = os.getenv("DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
-
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
 
 def run_migrations_offline():
-    url = config.get_main_option("sqlalchemy.url")
+    url = os.getenv("DATABASE_URL") or config.get_main_option("sqlalchemy.url")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        compare_type=True,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 def run_migrations_online():
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    connectable = engine
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            render_as_batch=True,
+        )
         with context.begin_transaction():
             context.run_migrations()
 
