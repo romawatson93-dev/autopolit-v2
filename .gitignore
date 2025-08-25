@@ -17,3 +17,7 @@ Thumbs.db
 *.log
 dist/
 build/
+
+# Telethon session files
+userbot/sessions/*
+
