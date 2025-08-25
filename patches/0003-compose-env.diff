@@ -1,0 +1,29 @@
+*** a/docker-compose.yml
+--- b/docker-compose.yml
+@@
+   worker:
+     build:
+       context: ./worker
+     image: autopolit-v2-worker
+     depends_on:
+       - redis
+     environment:
+-      - REDIS_HOST=redis
+-      - RENDER_DPI=300
+-      - RENDER_TIMEOUT_SEC=120
+-      - RENDER_FALLBACK=1
++      - REDIS_HOST=redis
++      - RENDER_DPI=${RENDER_DPI:-220}
++      - RENDER_TIMEOUT_SEC=${RENDER_TIMEOUT_SEC:-30}
++      - RENDER_THREADS=${RENDER_THREADS:-2}
++      - RENDER_FALLBACK=${RENDER_FALLBACK:-1}
++      - WATERMARK_FONT=${WATERMARK_FONT:-DejaVu-Sans}
++      - WATERMARK_OPACITY=${WATERMARK_OPACITY:-35}
++      - WATERMARK_SIZE_PCT=${WATERMARK_SIZE_PCT:-7}
++      - WATERMARK_TILT=${WATERMARK_TILT:-20}
+     volumes:
+       - pgdata:/var/lib/postgresql/data
+-      - ./data:/data
++      - ./data:/data
+     ports:
+       - "8001:8000"

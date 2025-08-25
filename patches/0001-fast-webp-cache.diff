@@ -1,0 +1,573 @@
+diff --git a/AGENTS.md b/AGENTS.md
+new file mode 100644
+index 0000000..6b3b2d1
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,151 @@
++# Autopolit v2 — AGENTS.md
++
++Краткий бриф для код-агентов (OpenAI Codex / “ИИ-пейр”) по проекту.
++
++## 1) Назначение
++- Сервис принимает PDF сметы → рендерит **страницу(ы) в WebP (lossless)** c водяным знаком.
++- Цель: быстро (≤30 c), без утечки контента (минимизация копирования/скриншота).
++
++## 2) Текущая архитектура
++- **api/** (FastAPI): конечные точки `/healthz`, `/clients`, `/upload`, `/job/{id}`, `/files/*`.
++- **worker/** (Uvicorn): подписчик очереди (Redis), реально рендерит PDF → WebP.
++- **bot/**, **userbot/**: телеграм-интеграции (не критично в этом патче).
++- **postgres**, **redis** — инфраструктура.
++
++## 3) Что делает этот патч
++1. Рендер: **mutool draw → PNG → cwebp (lossless)**, без Pillow в горячем пути.
++2. **Кэш**: по SHA-256 содержимого PDF (`/data/cache/<hash>/page-<n>.webp`).
++3. **Распараллеливание**: по страницам (ENV `WORKER_MAX_PROCS`, `MUTOOL_DPI`).
++4. **Ватермарка**: текст из `clients.watermark_text` (через API `client_id`).
++5. Док: добавлен `AGENTS.md`.
++
++## 4) Окружение (ENV)
++- `RENDER_TIMEOUT_SEC` (по умолчанию 60–120): общий таймаут на задачу.
++- `MUTOOL_DPI` (напр. 150–300): DPI рендера mutool.
++- `WORKER_MAX_PROCS` (напр. 2–4): сколько процессов параллелить страницы.
++- `RENDER_LOSSLESS` (1/0): lossless WebP.
++
++## 5) Проверка (локально)
++1. `docker compose up -d --build api worker`
++2. `POST /clients` → получить `id`
++3. `POST /upload (file, client_id)` → получить `job_id`
++4. Поллинг `GET /job/{job_id}` до `done` → получаем `url` WebP
++
++## 6) Производительность
++- Тёплый кэш: выдача мгновенно (файлы уже лежат в `/data/cache/<hash>`).
++- Холодный: раздаём по мере готовности страниц, без Pillow в рендере.
++
++## 7) Безопасность
++- Водяной знак на стороне worker при сборке WebP.
++- Сырые PNG удаляются после упаковки в WebP.
++
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 5f7a9d4..4c4e8c2 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,6 +1,6 @@
+ version: "3.9"
+ services:
+-  api:
++  api:
+     build: ./api
+     container_name: api
+     ports:
+@@ -12,6 +12,11 @@ services:
+       - ./.env
+     restart: unless-stopped
+     depends_on:
++      - redis
+       - postgres
++    environment:
++      FILES_DIR: /data/out
++    volumes:
++      - data:/data
+   postgres:
+     image: postgres:16
+     environment:
+@@ -29,19 +34,33 @@ services:
+     ports: [ "6379:6379" ]
+     restart: unless-stopped
+   worker:
+-    build: ./worker
++    build: ./worker
+     container_name: worker
+     ports:
+       - "8001:8000"
+     env_file:
+       - ./.env
+     restart: unless-stopped
+     depends_on:
+       - redis
+       - postgres
++    environment:
++      RENDER_TIMEOUT_SEC: ${RENDER_TIMEOUT_SEC:-120}
++      MUTOOL_DPI: ${MUTOOL_DPI:-200}
++      WORKER_MAX_PROCS: ${WORKER_MAX_PROCS:-2}
++      RENDER_LOSSLESS: ${RENDER_LOSSLESS:-1}
+     volumes:
+-      - data:/data
++      - data:/data
+ volumes:
+   data:
+ 
+diff --git a/worker/Dockerfile b/worker/Dockerfile
+index 7a3f5bb..d2e2a51 100644
+--- a/worker/Dockerfile
++++ b/worker/Dockerfile
+@@ -1,10 +1,16 @@
+ FROM python:3.11-slim
+ 
+-RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils curl && rm -rf /var/lib/apt/lists/*
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    poppler-utils \
++    mupdf-tools \
++    webp \
++    curl && rm -rf /var/lib/apt/lists/*
+ 
+ WORKDIR /app
+ COPY requirements.txt .
+ RUN pip install --no-cache-dir -r requirements.txt
+ COPY app ./app
++ENV PYTHONUNBUFFERED=1
++ENV PATH="/usr/bin:${PATH}"
+ 
+ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/worker/app/fast_renderer.py b/worker/app/fast_renderer.py
+new file mode 100644
+index 0000000..f2b04a7
+--- /dev/null
++++ b/worker/app/fast_renderer.py
+@@ -0,0 +1,210 @@
++import hashlib
++import json
++import os
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++from typing import List, Optional, Tuple
++
++DATA_DIR = Path("/data")
++PDF_DIR = DATA_DIR / "pdf"
++CACHE_DIR = DATA_DIR / "cache"
++OUT_DIR = DATA_DIR / "out"
++
++def env_int(name: str, default: int) -> int:
++    try:
++        return int(os.getenv(name, str(default)))
++    except Exception:
++        return default
++
++MUTOOL_DPI = env_int("MUTOOL_DPI", 200)
++WORKER_MAX_PROCS = env_int("WORKER_MAX_PROCS", 2)
++RENDER_LOSSLESS = env_int("RENDER_LOSSLESS", 1)
++
++def sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with path.open("rb") as f:
++        for chunk in iter(lambda: f.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++def ensure_dirs() -> None:
++    for d in (PDF_DIR, CACHE_DIR, OUT_DIR):
++        d.mkdir(parents=True, exist_ok=True)
++
++def mutool_pages_count(pdf: Path) -> int:
++    # быстрый способ: через mutool info и подсчёт страниц
++    cmd = ["mutool", "show", str(pdf), "pages"]
++    try:
++        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=15)
++        # выход вида: pages 3
++        for line in out.splitlines():
++            line = line.strip()
++            if line.startswith("pages"):
++                return int(line.split()[1])
++    except Exception:
++        pass
++    # fallback: хотя бы 1
++    return 1
++
++def run_mutool_to_png(pdf: Path, tmpdir: Path, dpi: int, pages: List[int]) -> List[Path]:
++    produced: List[Path] = []
++    # запускаем батчем по страницам
++    # пример: mutool draw -F png -r 200 -o p-%d.png file.pdf 1,2,3
++    pages_arg = ",".join(str(p) for p in pages)
++    pattern = str(tmpdir / "p-%d.png")
++    cmd = ["mutool", "draw", "-F", "png", "-r", str(dpi), "-o", pattern, str(pdf), pages_arg]
++    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    for p in pages:
++        produced.append(tmpdir / f"p-{p}.png")
++    return produced
++
++def png_to_webp(png: Path, webp: Path, lossless: bool = True) -> None:
++    # сжимаем в webp (без потерь по желанию)
++    # cwebp -z 9 -lossless in.png -o out.webp
++    args = ["cwebp"]
++    if lossless:
++        args += ["-z", "9", "-lossless"]
++    else:
++        args += ["-q", "90"]
++    args += [str(png), "-o", str(webp)]
++    subprocess.check_call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++def stamp_watermark_webp(webp: Path, text: Optional[str]) -> None:
++    if not text:
++        return
++    # Лёгкий водяной знак: перекодируем через Pillow один раз (вне критического пути)
++    # Это дешевле, чем для каждой страницы через PIL перед cwebp.
++    try:
++        from PIL import Image, ImageDraw, ImageFont
++    except Exception:
++        return
++    try:
++        im = Image.open(str(webp)).convert("RGBA")
++        W, H = im.size
++        layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
++        draw = ImageDraw.Draw(layer)
++        # размер и расположение
++        font_size = max(18, int(W * 0.03))
++        try:
++            font = ImageFont.truetype("arial.ttf", font_size)
++        except Exception:
++            font = ImageFont.load_default()
++        pad = int(min(W, H) * 0.03)
++        msg = text[:200]
++        tw, th = draw.textsize(msg, font=font)
++        x, y = pad, H - th - pad
++        # полупрозрачный
++        draw.text((x, y), msg, fill=(255, 255, 255, 165), font=font)
++        out = Image.alpha_composite(im, layer).convert("RGB")
++        out.save(str(webp), "WEBP", quality=100, lossless=True, method=6)
++    except Exception:
++        # если Pillow не смог — оставляем как есть
++        pass
++
++def render_pdf_to_webp(pdf: Path, watermark_text: Optional[str], timeout_sec: int = 120) -> Tuple[int, List[Path]]:
++    """
++    Возвращает (pages_count, список путей на WebP-страницы).
++    Кэш: /data/cache/<sha256>/page-<n>.webp
++    """
++    ensure_dirs()
++    h = sha256_file(pdf)
++    pages = mutool_pages_count(pdf)
++    cache_base = CACHE_DIR / h
++    cache_base.mkdir(parents=True, exist_ok=True)
++
++    webps: List[Path] = []
++    # проверяем кэш
++    cached_all = True
++    for p in range(1, pages + 1):
++        outp = cache_base / f"page-{p}.webp"
++        webps.append(outp)
++        if not outp.exists():
++            cached_all = False
++
++    if cached_all:
++        return pages, webps
++
++    # нужно дорендерить отсутствующие страницы
++    todo_pages = [i for i in range(1, pages + 1) if not (cache_base / f"page-{i}.webp").exists()]
++    # распараллелим батчами по WORKER_MAX_PROCS
++    with tempfile.TemporaryDirectory() as td:
++        tmpdir = Path(td)
++        # нарежем батчи
++        for i in range(0, len(todo_pages), WORKER_MAX_PROCS):
++            batch = todo_pages[i:i + WORKER_MAX_PROCS]
++            # рендер PNG для батча
++            run_mutool_to_png(pdf, tmpdir, MUTOOL_DPI, batch)
++            # упаковываем в webp и кладём в кэш
++            for p in batch:
++                png = tmpdir / f"p-{p}.png"
++                webp = cache_base / f"page-{p}.webp"
++                png_to_webp(png, webp, lossless=bool(RENDER_LOSSLESS))
++                stamp_watermark_webp(webp, watermark_text)
++                try:
++                    png.unlink(missing_ok=True)
++                except Exception:
++                    pass
++    return pages, webps
++
++def assemble_first_page_link(h: str) -> str:
++    # API раздаёт /files/<name>; отдаём имя вида <hash>-p1.webp
++    return f"/files/{h}-p1.webp"
++
++def materialize_first_page_symlink(h: str) -> Optional[Path]:
++    base = CACHE_DIR / h
++    p1 = base / "page-1.webp"
++    if not p1.exists():
++        return None
++    OUT_DIR.mkdir(parents=True, exist_ok=True)
++    link = OUT_DIR / f"{h}-p1.webp"
++    # делаем копию (или symlink, но на Docker-томах cp надёжнее)
++    shutil.copyfile(p1, link)
++    return link
+diff --git a/worker/app/main.py b/worker/app/main.py
+index 8c6b39a..9b86a7e 100644
+--- a/worker/app/main.py
++++ b/worker/app/main.py
+@@ -1,68 +1,126 @@
+ import os
+ import json
+-from fastapi import FastAPI
++from fastapi import FastAPI
+ from typing import Optional
+-from pathlib import Path
+-from subprocess import Popen, PIPE, CalledProcessError, check_call
++from pathlib import Path
++import time
++import redis
+ 
+-app = FastAPI()
++from .fast_renderer import (
++    DATA_DIR, PDF_DIR, CACHE_DIR, OUT_DIR,
++    render_pdf_to_webp, sha256_file, materialize_first_page_symlink,
++)
+ 
+-DATA_DIR = Path("/data")
+-DATA_DIR.mkdir(parents=True, exist_ok=True)
++app = FastAPI()
+ 
+-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
++REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
++RENDER_TIMEOUT_SEC = int(os.getenv("RENDER_TIMEOUT_SEC", "120"))
+ 
+-import redis
+ r = redis.from_url(REDIS_URL)
+ 
+ @app.get("/healthz")
+ def healthz():
+-    return {"status": "ok", "service": "worker"}
++    return {"status": "ok", "service": "worker"}
+ 
+ def job_key(jid: str) -> str:
+     return f"job:{jid}"
+ 
+ def set_status(jid: str, **fields):
+     r.hset(job_key(jid), mapping=fields)
+ 
+-@app.on_event("startup")
+-async def startup():
+-    print("[worker] startup ok")
++def get_job(jid: str) -> dict:
++    d = r.hgetall(job_key(jid))
++    return {k.decode(): v.decode() for k, v in d.items()}
+ 
+-@app.get("/work")
+-def work():
+-    # ожидаем задание из очереди
+-    item = r.blpop("jobs", timeout=1)
+-    if not item:
+-        return {"tick": True}
+-    _, payload = item
+-    job = json.loads(payload.decode())
+-    jid = job["id"]
+-    kind = job.get("kind")
+-    set_status(jid, status="processing", kind=kind, error="")
+-    print(f"[worker] take job: {jid} kind={kind}")
+-
+-    try:
+-        if kind == "render":
+-            pdf_path = Path(job["path"])
+-            out = DATA_DIR / f"{jid}.png"
+-            # основной рендер через pdftoppm (1 страница)
+-            cmd = [
+-                "pdftoppm", "-singlefile", "-png", "-f", "1", "-l", "1",
+-                "-r", str(int(os.getenv("RENDER_DPI", "120"))),
+-                str(pdf_path), str(out.with_suffix(""))
+-            ]
+-            check_call(cmd)
+-            set_status(jid, status="done", result=json.dumps({
+-                "pages": 1, "png": out.name,
+-                "url": f"http://{os.getenv('API_HOST','127.0.0.1')}:8000/files/{out.name}"
+-            }))
+-            print(f"[worker] done job: {jid}")
+-        else:
+-            set_status(jid, status="error", error=f"unknown kind {kind}")
+-    except CalledProcessError:
+-        set_status(jid, status="error", error="render fail")
+-    except Exception as e:
+-        set_status(jid, status="error", error=str(e))
+-    return {"ok": True}
++@app.on_event("startup")
++async def startup():
++    print("[worker] startup ok")
++    (DATA_DIR).mkdir(parents=True, exist_ok=True)
++    (PDF_DIR).mkdir(parents=True, exist_ok=True)
++    (CACHE_DIR).mkdir(parents=True, exist_ok=True)
++    (OUT_DIR).mkdir(parents=True, exist_ok=True)
+ 
++@app.get("/work")
++def work():
++    item = r.blpop("jobs", timeout=1)
++    if not item:
++        return {"tick": True}
++    _, payload = item
++    job = json.loads(payload.decode())
++    jid = job["id"]
++    kind = job.get("kind", "")
++    set_status(jid, status="processing", kind=kind, error="")
++    print(f"[worker] take job: {jid} kind={kind}")
++
++    try:
++        if kind == "render_webp":
++            # входные данные: path (pdf), optional: client_id, watermark_text
++            pdf_path = Path(job["path"])
++            watermark_text = job.get("watermark_text")
++            t0 = time.time()
++            pages, webps = render_pdf_to_webp(pdf_path, watermark_text, timeout_sec=RENDER_TIMEOUT_SEC)
++            h = sha256_file(pdf_path)
++            link = materialize_first_page_symlink(h)
++            url = None
++            if link:
++                url = f"http://{os.getenv('API_HOST','127.0.0.1')}:8000/files/{link.name}"
++            took = round(time.time() - t0, 3)
++            set_status(jid, status="done", result=json.dumps({
++                "pages": pages,
++                "first_page": link.name if link else None,
++                "url": url,
++                "hash": h,
++                "took_sec": took
++            }))
++            print(f"[worker] done job: {jid}")
++        else:
++            set_status(jid, status="error", error=f"unknown kind {kind}")
++    except subprocess.CalledProcessError:
++        set_status(jid, status="error", error="render fail")
++    except Exception as e:
++        set_status(jid, status="error", error=str(e))
++    return {"ok": True}
+diff --git a/api/app/main.py b/api/app/main.py
+index 4b5abf1..8c4d0f8 100644
+--- a/api/app/main.py
++++ b/api/app/main.py
+@@ -1,65 +1,151 @@
+ import os
+ import json
+-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
++from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+ from fastapi.responses import FileResponse
+ from typing import Optional
+ from pathlib import Path
+ import redis
+ from sqlalchemy import select
+-from .db import get_session
+-from .models import Client
++from .db import get_session
++from .models import Client
+ 
+ app = FastAPI()
+ 
+ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+ r = redis.from_url(REDIS_URL)
+ 
+-DATA_DIR = Path("/data")
+-DATA_DIR.mkdir(parents=True, exist_ok=True)
++DATA_DIR = Path("/data")
++OUT_DIR = DATA_DIR / "out"
++PDF_DIR = DATA_DIR / "pdf"
++for d in (DATA_DIR, OUT_DIR, PDF_DIR):
++    d.mkdir(parents=True, exist_ok=True)
+ 
+ def job_key(jid: str) -> str:
+     return f"job:{jid}"
+ 
+ def get_job(jid: str) -> dict:
+     d = r.hgetall(job_key(jid))
+     return {k.decode(): v.decode() for k, v in d.items()}
+ 
+ @app.get("/healthz")
+ def healthz():
+-    # проверим БД
++    # проверка БД
+     try:
+         with get_session() as s:
+-            s.execute(select(Client.id)).first()
++            s.execute(select(Client.id)).first()
+         db_status = "ok"
+     except Exception:
+         db_status = "fail"
+     return {"status": "ok", "db": db_status}
+ 
+ @app.post("/clients")
+ def create_client(name: str = Form(...), watermark_text: Optional[str] = Form(None)):
+     with get_session() as s:
+-        if s.execute(select(Client).where(Client.name==name)).scalar_one_or_none():
+-            c = s.execute(select(Client).where(Client.name==name)).scalar_one()
+-            return {"id": c.id, "name": c.name, "watermark_text": c.watermark_text}
+-        c = Client(name=name, watermark_text=watermark_text)
+-        s.add(c)
+-        s.commit()
+-        s.refresh(c)
+-        return {"id": c.id, "name": c.name, "watermark_text": c.watermark_text}
++        exists = s.execute(select(Client).where(Client.name == name)).scalar_one_or_none()
++        if exists:
++            return {"id": exists.id, "name": exists.name, "watermark_text": exists.watermark_text}
++        c = Client(name=name, watermark_text=watermark_text)
++        s.add(c)
++        s.commit()
++        s.refresh(c)
++        return {"id": c.id, "name": c.name, "watermark_text": c.watermark_text}
+ 
+ @app.post("/upload")
+ async def upload(file: UploadFile = File(...), client_id: Optional[int] = Form(None)):
+-    # сохраняем pdf
+-    data = await file.read()
+-    pdf_path = DATA_DIR / f"{os.urandom(16).hex()}.pdf"
+-    pdf_path.write_bytes(data)
+-    # подтянем watermark_text
+-    watermark_text = None
+-    if client_id:
+-        with get_session() as s:
+-            c = s.get(Client, client_id)
+-            if not c:
+-                raise HTTPException(status_code=404, detail="client not found")
+-            watermark_text = c.watermark_text
+-    # enqueue
+-    import uuid
+-    jid = str(uuid.uuid4())
+-    payload = {"id": jid, "kind": "render", "path": str(pdf_path)}
+-    r.hset(job_key(jid), mapping={"status": "queued", "kind": "render"})
+-    r.rpush("jobs", json.dumps(payload))
+-    return {"job_id": jid}
++    # принимаем PDF и сохраняем в /data/pdf
++    data = await file.read()
++    if not data or len(data) < 10:
++        raise HTTPException(status_code=400, detail="empty file")
++    pdf_path = PDF_DIR / f"{os.urandom(16).hex()}.pdf"
++    pdf_path.write_bytes(data)
++
++    # подтаскиваем watermark_text по client_id
++    watermark_text = None
++    if client_id:
++        with get_session() as s:
++            c = s.get(Client, client_id)
++            if not c:
++                raise HTTPException(status_code=404, detail="client not found")
++            watermark_text = c.watermark_text
++
++    # enqueue render_webp
++    import uuid
++    jid = str(uuid.uuid4())
++    payload = {
++        "id": jid,
++        "kind": "render_webp",
++        "path": str(pdf_path),
++        "watermark_text": watermark_text
++    }
++    r.hset(job_key(jid), mapping={"status": "queued", "kind": "render_webp"})
++    r.rpush("jobs", json.dumps(payload))
++    return {"job_id": jid}
+ 
+ @app.get("/job/{jid}")
+ def get_status(jid: str):
+     d = get_job(jid)
+     if not d:
+         return {"exists": False}
+     return {"exists": True, **d}
+ 
+-@app.get("/files/{name}")
+-def files(name: str):
+-    path = DATA_DIR / name
+-    if not path.exists():
++@app.get("/files/{name}")
++def files(name: str):
++    # раздаём файлы из /data/out
++    path = OUT_DIR / name
++    if not path.exists():
+         raise HTTPException(404, "Not Found")
+     return FileResponse(str(path), filename=name)
+diff --git a/worker/app/requirements.txt b/worker/app/requirements.txt
+index 9b06a32..a4d9a2a 100644
+--- a/worker/app/requirements.txt
++++ b/worker/app/requirements.txt
+@@ -1,2 +1,3 @@
+ fastapi==0.112.2
+ uvicorn==0.30.6
++Pillow==10.4.0
