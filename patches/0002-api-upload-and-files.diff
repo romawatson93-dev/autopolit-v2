@@ -1,0 +1,102 @@
+*** a/api/app/main.py
+--- b/api/app/main.py
+@@
+-import os, uuid, json
+-from fastapi import FastAPI, UploadFile, Form
+-from fastapi.responses import JSONResponse, FileResponse
+-from .db import get_session
+-from .models import Client
+-from sqlalchemy import select
+-from redis import Redis
++import os, uuid, json, hashlib
++from fastapi import FastAPI, UploadFile, Form
++from fastapi.responses import JSONResponse
++from fastapi.staticfiles import StaticFiles
++from .db import get_session
++from .models import Client
++from sqlalchemy import select
++from redis import Redis
+ 
+ app = FastAPI()
+ r = Redis(host=os.getenv("REDIS_HOST","redis"), port=int(os.getenv("REDIS_PORT","6379")), db=0, decode_responses=True)
+ DATA_DIR = "/data"
+ os.makedirs(DATA_DIR, exist_ok=True)
++PDF_DIR = os.path.join(DATA_DIR, "pdf")
++os.makedirs(PDF_DIR, exist_ok=True)
+ 
+ @app.get("/healthz")
+ def healthz():
+     from .db import SessionLocal
+     try:
+         with SessionLocal() as s:
+             s.execute(select(1))
+         db="ok"
+     except Exception:
+         db="fail"
+     return {"status":"ok","db":db}
+ 
++# статика для файлов (webp/png)
++app.mount("/files", StaticFiles(directory=DATA_DIR), name="files")
++
+ @app.post("/clients")
+ def create_client(name: str = Form(...), watermark_text: str = Form(None)):
+     from .db import SessionLocal
+     with SessionLocal() as s:
+         if s.execute(select(Client).where(Client.name==name)).scalar_one_or_none():
+             return JSONResponse({"detail":"already exists"}, status_code=409)
+         c = Client(name=name, watermark_text=watermark_text)
+         s.add(c); s.commit(); s.refresh(c)
+         return {"id": c.id, "name": c.name, "watermark_text": c.watermark_text}
+ 
+ @app.post("/upload")
+ async def upload(file: UploadFile, client_id: int = Form(None)):
+     # сохраняем PDF под именем по SHA256 содержания (для кэша)
+-    dst = os.path.join(DATA_DIR, f"{uuid.uuid4()}.pdf")
+-    with open(dst,"wb") as f:
+-        f.write(await file.read())
++    pdf_bytes = await file.read()
++    pdf_sha = hashlib.sha256(pdf_bytes).hexdigest()
++    dst = os.path.join(PDF_DIR, f"{pdf_sha}.pdf")
++    if not os.path.exists(dst):
++        with open(dst,"wb") as f:
++            f.write(pdf_bytes)
+ 
+     wm_text = None
+     if client_id:
+         from .db import SessionLocal
+         with SessionLocal() as s:
+             c = s.get(Client, client_id)
+             wm_text = c.watermark_text if c else None
+ 
+-    job_id = str(uuid.uuid4())
+-    r.rpush("queue:render", job_id)
+-    r.hset(f"job:{job_id}", mapping={
+-        "kind":"render_webp",
+-        "status":"queued",
+-        "pdf_path": dst,
+-        "watermark_text": wm_text or ""
+-    })
++    job_id = str(uuid.uuid4())
++    r.rpush("queue:render", job_id)
++    r.hset(f"job:{job_id}", mapping={
++        "kind":"render_webp",
++        "status":"queued",
++        "pdf_path": dst,
++        "watermark_text": wm_text or ""
++    })
+     return {"job_id": job_id, "queued": True}
+ 
+ @app.get("/job/{job_id}")
+ def job_status(job_id: str):
+     key = f"job:{job_id}"
+     if not r.exists(key):
+         return {"exists": False}
+     d = r.hgetall(key)
+     # result уже строка JSON
+     return {
+         "exists": True,
+         "status": d.get("status"),
+         "kind": d.get("kind"),
+         "result": d.get("result"),
+         "error": d.get("error")
+     }

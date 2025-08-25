@@ -1,0 +1,35 @@
+*** /dev/null
+--- b/AGENTS.md
+@@
++# OrbitSend Agents — краткая карта для Codex/Code Agent
++
++## Контур
++- **API** (`/api`): FastAPI. Принимает PDF, кладёт в Redis задачу, отдаёт статикой `/files/*`.
++- **Worker** (`/worker`): Uvicorn-сервис, читает `queue:render`, рендерит **MuPDF→WebP (lossless)**, добавляет водяные знаки, пишет результат и кэш.
++- **Redis**: очередь задач и статусы `job:*`.
++- **Postgres**: `clients(id, name, watermark_text, created_at)` — хранит текст ватермарки.
++
++## Критические параметры
++- `RENDER_DPI` (220 по умолчанию), `RENDER_TIMEOUT_SEC` (30), `RENDER_THREADS` (2).
++- Водяной знак: `WATERMARK_FONT`, `WATERMARK_OPACITY (0..100)`, `WATERMARK_SIZE_PCT`, `WATERMARK_TILT`.
++
++## Кэш
++- Базовый рендер по SHA256 контента PDF: `/data/cache/<sha>.webp`.
++- С водяным знаком: `/data/cache/<sha>.__wm_<md5(text)>*.webp`.
++- Итог для выдачи копируется в `/data/<job_id>.webp` → доступен как `GET /files/<job_id>.webp`.
++
++## Эндпоинты
++- `POST /clients` — `name`, `watermark_text?` → `{id,...}`.
++- `POST /upload` — `file: PDF`, `client_id?` → `{job_id}`.
++- `GET /job/{job_id}` — `{exists, status, kind, result?, error?}`.
++- `GET /healthz` — `{status, db}`.
++
++## Бэкенд-рендер
++- PNG → **WebP** делается вне Pillow: `mutool draw -F png` → `cwebp -lossless`.
++- Водяной знак: ImageMagick `convert ... -annotate`.
++- Фолбэк (если нужен): включается `RENDER_FALLBACK=1`.
++
++## Быстрый smoke
++1) `curl -F "name=Acme" -F "watermark_text=Итоговая стоимость 325850р" http://api:8000/clients`
++2) `curl -F "file=@doc.pdf" -F "client_id=1" http://api:8000/upload` → `job_id`
++3) `curl http://api:8000/job/<job_id>` → `url` на webp.
