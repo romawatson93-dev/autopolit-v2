@@ -1,9 +1,31 @@
 services:
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: \
+      POSTGRES_PASSWORD: \
+      POSTGRES_DB: \
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \ -d \"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   api:
     build: ./api
     container_name: api
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8000:8000"
     env_file:
       - .env
     restart: unless-stopped
+
+volumes:
+  pgdata:
