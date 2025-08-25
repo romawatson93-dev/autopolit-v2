@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь контент папки api (включая alembic.ini и каталог alembic)
+# Копируем весь контент папки api (включая alembic.ini, alembic/)
 COPY . .
 
 EXPOSE 8000
