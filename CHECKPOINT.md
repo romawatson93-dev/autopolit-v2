@@ -1,3 +1,4 @@
+[2025-08-25 15:28] [Life PC] — добавили pytest и первый тест /healthz
 [2025-08-25 15:26] [Life PC] — первый успешный пуш в GitHub, скрипты починили
 # Autopolit v2 — Checkpoint Log
 
@@ -6,4 +7,5 @@
 > [YYYY-MM-DD HH:MM] [author] — что сделали / что ломалось / что хотим дальше.
 
 [INIT PLACEHOLDER]
+
 
