@@ -19,7 +19,13 @@ def healthz():
 
 @app.post("/enqueue")
 def enqueue(name: str = Query(..., description="имя для обработки")):
-    job_id = enqueue_task({"name": name})
+    job_id = enqueue_task({"name": name}, kind="echo")
+    return {"job_id": job_id, "queued": True}
+
+@app.post("/render")
+def render(doc_url: str = Query(..., description="URL документа для рендера")):
+    # пока заглушка: просто кладём задание с kind=render
+    job_id = enqueue_task({"doc_url": doc_url}, kind="render")
     return {"job_id": job_id, "queued": True}
 
 @app.get("/job/{job_id}")

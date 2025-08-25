@@ -11,13 +11,26 @@ JOB_PREFIX = "job:"
 def r() -> Redis:
     return Redis.from_url(REDIS_URL, decode_responses=True)
 
-def process_job(payload: dict) -> dict:
-    # имитация работы: преобразуем имя в UPPER и считаем длину
+# ==== обработчики задач ====
+def handle_echo(payload: dict) -> dict:
     name = (payload.get("name") or "").strip()
-    result = {"upper": name.upper(), "length": len(name)}
-    # можно добавить sleep для демонстрации
+    time.sleep(0.2)
+    return {"upper": name.upper(), "length": len(name)}
+
+def handle_render(payload: dict) -> dict:
+    doc_url = payload.get("doc_url", "")
+    # заглушка: «рендерим» во что-то вроде PNG-ресурса
     time.sleep(0.5)
-    return result
+    return {
+        "pages": 1,
+        "preview_png": f"render://preview?src={doc_url}",
+        "note": "stub-render-ok"
+    }
+
+HANDLERS = {
+    "echo": handle_echo,
+    "render": handle_render,
+}
 
 def worker_loop():
     client = r()
@@ -29,21 +42,28 @@ def worker_loop():
             _, raw = item
             data = json.loads(raw)
             job_id = data["id"]
-            payload = data["payload"]
-            client.hset(JOB_PREFIX+job_id, mapping={"status":"processing"})
-            result = process_job(payload)
+            kind = data.get("kind", "generic")
+            payload = data.get("payload", {})
+
+            client.hset(JOB_PREFIX+job_id, mapping={"status":"processing","kind":kind})
+            handler = HANDLERS.get(kind)
+            if handler is None:
+                client.hset(JOB_PREFIX+job_id, mapping={"status":"error","error":f"unknown kind: {kind}"})
+                continue
+
+            result = handler(payload)
             client.hset(JOB_PREFIX+job_id, mapping={
                 "status": "done",
-                "result": json.dumps(result, ensure_ascii=False)
+                "result": json.dumps(result, ensure_ascii=False),
+                "kind": kind,
             })
         except Exception as e:
-            # зафиксируем ошибку в job, чтобы видеть причину
             try:
                 if "job_id" in locals():
                     client.hset(JOB_PREFIX+job_id, mapping={"status":"error","error":str(e)})
             except Exception:
                 pass
-            time.sleep(1)
+            time.sleep(0.5)
 
 @app.on_event("startup")
 def startup():

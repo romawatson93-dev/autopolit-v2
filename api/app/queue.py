@@ -9,11 +9,11 @@ def _r() -> Redis:
 QUEUE_KEY = "jobs"
 JOB_PREFIX = "job:"
 
-def enqueue_task(payload: dict) -> str:
+def enqueue_task(payload: dict, kind: str = "generic") -> str:
     job_id = str(uuid.uuid4())
     r = _r()
-    r.hset(JOB_PREFIX+job_id, mapping={"status":"queued"})
-    r.lpush(QUEUE_KEY, json.dumps({"id": job_id, "payload": payload}))
+    r.hset(JOB_PREFIX+job_id, mapping={"status":"queued","kind":kind})
+    r.lpush(QUEUE_KEY, json.dumps({"id": job_id, "kind": kind, "payload": payload}))
     return job_id
 
 def get_job(job_id: str) -> dict | None:
