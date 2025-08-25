@@ -38,6 +38,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    volumes:
+      - files:/data
     restart: unless-stopped
 
   worker:
@@ -52,6 +54,8 @@ services:
       - "8001:8000"
     env_file:
       - .env
+    volumes:
+      - files:/data
     restart: unless-stopped
 
   bot:
@@ -80,7 +84,10 @@ services:
       - "8003:8000"
     env_file:
       - .env
+    volumes:
+      - ./userbot/sessions:/app/sessions
     restart: unless-stopped
 
 volumes:
   pgdata:
+  files:
