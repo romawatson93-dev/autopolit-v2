@@ -1,7 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from sqlalchemy import text
 from .db import engine
+from .queue import enqueue_task, get_job
 
 app = FastAPI(title="autopolit-v2 API")
 
@@ -15,3 +16,15 @@ def healthz():
     except Exception:
         db_ok = False
     return {"status": "ok", "db": "ok" if db_ok else "fail"}
+
+@app.post("/enqueue")
+def enqueue(name: str = Query(..., description="имя для обработки")):
+    job_id = enqueue_task({"name": name})
+    return {"job_id": job_id, "queued": True}
+
+@app.get("/job/{job_id}")
+def job_status(job_id: str):
+    data = get_job(job_id)
+    if not data:
+        return {"exists": False}
+    return {"exists": True, **data}
